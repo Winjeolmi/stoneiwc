@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import Stripe from 'stripe'
 import { createPendingOrder } from '@/lib/orders'
+import { computeOrderPricing } from '@/lib/pricing'
 
 type CheckoutItem = {
   id?: string
@@ -40,8 +41,6 @@ type CreateStripePaymentIntentBody = {
   phone?: string
   giftCardCode?: string
   giftCardAppliedAmount?: number
-  // Echoed back by the client so a re-initialized checkout reuses the same
-  // PaymentIntent instead of creating a duplicate (and a duplicate order).
   paymentIntentId?: string
 }
 
@@ -66,21 +65,16 @@ export async function POST(request: Request) {
     const body = (await request.json()) as CreateStripePaymentIntentBody
     const {
       items,
-      subtotal,
       couponCode,
-      couponDiscount,
       shippingMethod,
-      shippingCost,
       shippingAddress,
       billingAddress,
       billingSameAsShipping,
-      totalAmount,
       email,
       firstName,
       lastName,
       phone,
       giftCardCode,
-      giftCardAppliedAmount,
       paymentIntentId: existingPaymentIntentId,
     } = body
 
@@ -88,11 +82,12 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Cart items are required' }, { status: 400 })
     }
 
-    if (totalAmount === undefined || totalAmount === null || Number.isNaN(Number(totalAmount))) {
-      return NextResponse.json({ error: 'Total amount is required' }, { status: 400 })
+    const pricing = await computeOrderPricing({ items, couponCode, shippingMethod, giftCardCode })
+    if (!pricing.ok) {
+      return NextResponse.json({ error: pricing.error }, { status: 400 })
     }
 
-    const amountInCents = Math.round(Number(totalAmount) * 100)
+    const amountInCents = Math.round(pricing.total * 100)
 
     const truncate = (s: string, max = 500) =>
       s.length <= max ? s : s.slice(0, max - 1) + '…'
@@ -104,17 +99,15 @@ export async function POST(request: Request) {
     )
     const fullName = [firstName, lastName].filter(Boolean).join(' ').trim()
 
-    // Rich metadata — everything an admin needs is visible in the Stripe
-    // Dashboard without opening Sanity Studio.
     const metadata: Record<string, string> = {
       order_type: 'storefront',
       customer_email: email || '',
       customer_name: fullName,
       items_count: String(items.length),
       items_summary: itemsSummary,
-      subtotal: subtotal != null ? Number(subtotal).toFixed(2) : '0.00',
+      subtotal: pricing.subtotal.toFixed(2),
       shipping_method: shippingMethod || 'standard',
-      shipping_cost: shippingCost ? Number(shippingCost).toFixed(2) : '0.00',
+      shipping_cost: pricing.shippingCost.toFixed(2),
       ship_name:
         `${shippingAddress?.firstName ?? firstName ?? ''} ${shippingAddress?.lastName ?? lastName ?? ''}`.trim(),
       ship_line1: shippingAddress?.address ?? '',
@@ -126,13 +119,12 @@ export async function POST(request: Request) {
       ...(phone && { customer_phone: phone }),
       ...(couponCode && {
         coupon_code: couponCode,
-        coupon_discount: Number(couponDiscount ?? 0).toFixed(2),
+        coupon_discount: pricing.couponDiscount.toFixed(2),
       }),
       ...(giftCardCode && { gift_card_code: giftCardCode }),
-      ...(giftCardAppliedAmount !== undefined &&
-        giftCardAppliedAmount > 0 && {
-          gift_card_applied_amount: Number(giftCardAppliedAmount).toFixed(2),
-        }),
+      ...(pricing.giftCardApplied > 0 && {
+        gift_card_applied_amount: pricing.giftCardApplied.toFixed(2),
+      }),
     }
 
     const shipping = shippingAddress
@@ -150,10 +142,6 @@ export async function POST(request: Request) {
         }
       : undefined
 
-    // Reuse the existing PaymentIntent when the client is re-initializing the
-    // same checkout (e.g. after editing details), so we don't strand a second
-    // PaymentIntent — and a second pending order — behind. Only reuse one that
-    // hasn't started payment yet; otherwise fall through to a fresh intent.
     let paymentIntent: Stripe.PaymentIntent | null = null
     if (existingPaymentIntentId) {
       try {
@@ -182,29 +170,20 @@ export async function POST(request: Request) {
       })
     }
 
-    // Mirror the order into Sanity so admins can manage fulfillment in Studio.
-    // Errors here don't break checkout — the customer can still pay; we just
-    // log and rely on the Stripe Dashboard fallback for that PaymentIntent.
     let orderNumber: string | undefined
     try {
-      const orderItems = items.map((item) => {
-        const quantity = Number(item.quantity ?? 1)
-        const unitPrice = Number(item.price ?? 0)
-        return {
-          productId: item.id,
-          name: item.name ?? item.title ?? 'Item',
-          slug: item.slug,
-          image: item.image,
-          quantity,
-          unitPrice,
-          lineTotal: Math.round(unitPrice * quantity * 100) / 100,
-        }
-      })
+      const imageById = new Map(items.map((item) => [item.id, item.image]))
+      const orderItems = pricing.items.map((item) => ({
+        productId: item.id,
+        name: item.name,
+        slug: item.slug,
+        image: imageById.get(item.id),
+        quantity: item.quantity,
+        unitPrice: item.unitPrice,
+        lineTotal: item.lineTotal,
+      }))
 
-      const computedSubtotal =
-        subtotal != null
-          ? Number(subtotal)
-          : orderItems.reduce((sum, item) => sum + item.lineTotal, 0)
+      const computedSubtotal = pricing.subtotal
 
       const order = await createPendingOrder({
         stripePaymentIntentId: paymentIntent.id,
@@ -238,17 +217,15 @@ export async function POST(request: Request) {
         items: orderItems,
         subtotal: computedSubtotal,
         couponCode,
-        couponDiscount: couponDiscount ? Number(couponDiscount) : undefined,
+        couponDiscount: pricing.couponDiscount || undefined,
         shippingMethod: shippingMethod ?? 'standard',
-        shippingCost: shippingCost ? Number(shippingCost) : 0,
+        shippingCost: pricing.shippingCost,
         giftCardCode,
-        giftCardApplied:
-          giftCardAppliedAmount !== undefined ? Number(giftCardAppliedAmount) : undefined,
-        total: Number(totalAmount),
+        giftCardApplied: pricing.giftCardApplied || undefined,
+        total: pricing.total,
       })
       orderNumber = order.orderNumber
 
-      // Echo the order number into Stripe so the Dashboard links back to Sanity.
       try {
         await stripe.paymentIntents.update(paymentIntent.id, {
           metadata: { ...metadata, order_number: orderNumber },
@@ -258,7 +235,6 @@ export async function POST(request: Request) {
       }
     } catch (err) {
       console.error('Sanity order creation failed for PaymentIntent', paymentIntent.id, err)
-      // intentionally do not throw — checkout continues
     }
 
     return NextResponse.json({
