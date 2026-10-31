@@ -30,7 +30,12 @@ export const shippingMethodType = defineType({
       name: 'cost',
       title: 'Cost ($)',
       type: 'number',
-      validation: (Rule) => Rule.required().min(0),
+      validation: (Rule) =>
+        Rule.required().custom((cost) =>
+        cost === undefined || cost === 0 || cost >= 0.5
+        ? true
+        : 'Cost must be $0 (free) or at least $0.50'
+        ),
     }),
     defineField({
       name: 'isActive',
